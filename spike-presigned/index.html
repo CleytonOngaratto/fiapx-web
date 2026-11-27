@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spike 1 — presigned PUT de outra origem</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  .origin { font-family: ui-monospace, monospace; background: #8883; padding: .15rem .4rem; border-radius: .25rem; }
+  fieldset { border: 1px solid #8886; border-radius: .5rem; margin: 1rem 0; }
+  button { font: inherit; padding: .5rem 1rem; border-radius: .4rem; cursor: pointer; }
+  ol { padding-left: 1.2rem; }
+  li { margin: .5rem 0; }
+  .step { display: flex; gap: .5rem; align-items: baseline; }
+  .badge { flex: none; width: 5.5rem; font-weight: 600; }
+  .ok { color: #2e7d32; } .bad { color: #c62828; } .wait { color: #777; }
+  pre { background: #8881; padding: .6rem; border-radius: .4rem; overflow-x: auto; font-size: .82rem; margin: .3rem 0 0; }
+  progress { width: 100%; height: 1.2rem; }
+</style>
+</head>
+<body>
+<h1>Spike 1 — presigned PUT direto no object storage</h1>
+<p>Esta página roda em <span class="origin" id="origin"></span> e a API em
+<span class="origin api-url">http://localhost:8080</span> (troque com <code>?api=http://localhost:8081</code>).
+São origens diferentes de propósito: é a única
+forma de exercitar o preflight de CORS real, o host da URL assinada como o navegador o vê, e o
+progresso do upload.</p>
+
+<fieldset>
+  <legend>Enviar</legend>
+  <p><input type="file" id="file" accept="video/*"></p>
+  <p><button id="go">Executar o fluxo completo</button></p>
+  <progress id="prog" value="0" max="100" hidden></progress>
+</fieldset>
+
+<ol id="steps"></ol>
+
+<script>
+const API = new URLSearchParams(location.search).get('api') ?? 'http://localhost:8080';
+const OWNER = 'rm368677';
+document.getElementById('origin').textContent = location.origin;
+document.querySelectorAll('.api-url').forEach(el => { el.textContent = API; });
+
+const steps = document.getElementById('steps');
+function step(label) {
+  const li = document.createElement('li');
+  li.innerHTML = `<div class="step"><span class="badge wait">...</span><span class="txt"></span></div>`;
+  li.querySelector('.txt').textContent = label;
+  steps.appendChild(li);
+  return {
+    ok(detail) { mark(li, 'OK', 'ok', detail); },
+    bad(detail) { mark(li, 'FALHOU', 'bad', detail); }
+  };
+}
+function mark(li, text, cls, detail) {
+  const b = li.querySelector('.badge');
+  b.textContent = text; b.className = 'badge ' + cls;
+  if (detail) { const pre = document.createElement('pre'); pre.textContent = detail; li.appendChild(pre); }
+}
+
+document.getElementById('go').addEventListener('click', async () => {
+  steps.innerHTML = '';
+  const file = document.getElementById('file').files[0];
+  if (!file) { step('Escolha um arquivo primeiro').bad(); return; }
+
+  const s1 = step(`POST ${API}/videos — pedir a URL assinada (CORS da API)`);
+  let ticket;
+  try {
+    const res = await fetch(`${API}/videos`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ownerId: OWNER, filename: file.name, contentType: file.type || 'application/octet-stream' })
+    });
+    if (!res.ok) { s1.bad(`HTTP ${res.status}\n${await res.text()}`); return; }
+    ticket = await res.json();
+    const host = new URL(ticket.uploadUrl).host;
+    s1.ok(`videoId: ${ticket.videoId}\nobjectKey: ${ticket.objectKey}\nhost da URL assinada: ${host}\nvalida por: ${ticket.expiresInSeconds}s`);
+  } catch (e) {
+    s1.bad(`${e}\n\nSe isto falhou com "Failed to fetch", o CORS da API nao liberou ${location.origin}.`);
+    return;
+  }
+
+  const s2 = step('PUT na URL assinada — bytes direto ao storage, sem passar pela JVM');
+  const prog = document.getElementById('prog');
+  prog.hidden = false; prog.value = 0;
+
+  const etag = await new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', ticket.uploadUrl, true);
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.upload.onprogress = (ev) => { if (ev.lengthComputable) prog.value = (ev.loaded / ev.total) * 100; };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const tag = xhr.getResponseHeader('ETag');
+        s2.ok(`HTTP ${xhr.status}\nETag lido pelo navegador: ${tag ?? '(nulo — Expose-Headers nao liberou ETag)'}\nbytes: ${file.size}`);
+        resolve(tag);
+      } else {
+        s2.bad(`HTTP ${xhr.status}\n${xhr.responseText}`);
+        resolve(null);
+      }
+    };
+    xhr.onerror = () => {
+      s2.bad('Erro de rede ou CORS.\nO preflight OPTIONS no bucket provavelmente nao liberou esta origem,\nou o host da URL assinada nao e alcancavel daqui.');
+      resolve(null);
+    };
+    xhr.send(file);
+  });
+  if (etag === null) return;
+
+  const ext = ticket.objectKey.split('.').pop();
+  const s3 = step('Confirmar pelo servidor — HEAD no storage pelo endpoint INTERNO');
+  try {
+    const res = await fetch(`${API}/videos/uploaded/${OWNER}/${ticket.videoId}/${ext}`);
+    const body = await res.json();
+    if (res.ok && body.uploaded) s3.ok(JSON.stringify(body, null, 2));
+    else s3.bad(`HTTP ${res.status}\n${JSON.stringify(body, null, 2)}`);
+  } catch (e) { s3.bad(String(e)); }
+});
+</script>
+</body>
+</html>
